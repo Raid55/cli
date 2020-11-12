@@ -16,6 +16,7 @@ limitations under the License.
 package utils
 
 import (
+	"bufio"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -29,6 +30,11 @@ func RestrictedFilePerms() os.FileMode {
 	}
 
 	return 0400
+}
+
+// MakeDir makes dir at path with perms
+func MakeDir(path string, perms os.FileMode) error {
+	return os.Mkdir(path, perms)
 }
 
 // WriteFile atomically writes data to a file named by filename.
@@ -75,4 +81,23 @@ func WriteTempFile(name string, data []byte, perm os.FileMode) (string, error) {
 	}
 
 	return tmpFileName, nil
+}
+
+// ListDir docs
+func ListDir(path string) ([]os.FileInfo, error) {
+	return ioutil.ReadDir(path)
+}
+
+// WriteToBuffer docs
+func WriteToBuffer(buf *bufio.Writer, data []byte) error { // Write bytes to buffer
+	_, err := buf.Write(data)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// ReadSliceFromReader read slice from buf reader
+func ReadSliceFromReader(reader *bufio.Reader) ([]byte, error) {
+	return reader.ReadSlice('\n')
 }
