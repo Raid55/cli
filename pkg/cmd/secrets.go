@@ -19,8 +19,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/DopplerHQ/cli/pkg/configuration"
 	"github.com/DopplerHQ/cli/pkg/controllers"
@@ -38,10 +40,11 @@ type secretsResponse struct {
 }
 
 var secretsCmd = &cobra.Command{
-	Use:   "secrets",
-	Short: "Manage secrets",
-	Args:  cobra.NoArgs,
-	Run:   secrets,
+	Use:    "secrets",
+	Short:  "Manage secrets",
+	Args:   cobra.NoArgs,
+	PreRun: requiresToken,
+	Run:    secrets,
 }
 
 var secretsGetCmd = &cobra.Command{
@@ -51,8 +54,9 @@ var secretsGetCmd = &cobra.Command{
 
 Ex: output the secrets "API_KEY" and "CRYPTO_KEY":
 doppler secrets get API_KEY CRYPTO_KEY`,
-	Args: cobra.MinimumNArgs(1),
-	Run:  getSecrets,
+	Args:   cobra.MinimumNArgs(1),
+	PreRun: requiresToken,
+	Run:    getSecrets,
 }
 
 var secretsSetCmd = &cobra.Command{
@@ -62,8 +66,9 @@ var secretsSetCmd = &cobra.Command{
 
 Ex: set the secrets "API_KEY" and "CRYPTO_KEY":
 doppler secrets set API_KEY=123 CRYPTO_KEY=456`,
-	Args: cobra.MinimumNArgs(1),
-	Run:  setSecrets,
+	Args:   cobra.MinimumNArgs(1),
+	PreRun: requiresToken,
+	Run:    setSecrets,
 }
 
 var secretsDeleteCmd = &cobra.Command{
@@ -73,8 +78,9 @@ var secretsDeleteCmd = &cobra.Command{
 
 Ex: delete the secrets "API_KEY" and "CRYPTO_KEY":
 doppler secrets delete API_KEY CRYPTO_KEY`,
-	Args: cobra.MinimumNArgs(1),
-	Run:  deleteSecrets,
+	Args:   cobra.MinimumNArgs(1),
+	PreRun: requiresToken,
+	Run:    deleteSecrets,
 }
 
 var secretsDownloadCmd = &cobra.Command{
@@ -89,8 +95,81 @@ $ doppler secrets download --format=env /root/secrets.env
 
 Print your secrets to stdout in env format without writing to the filesystem
 $ doppler secrets download --format=env --no-file`,
-	Args: cobra.MaximumNArgs(1),
-	Run:  downloadSecrets,
+	Args:   cobra.MaximumNArgs(1),
+	PreRun: requiresToken,
+	Run:    downloadSecrets,
+}
+
+// TODO: revision the short, long, and example text
+var secretsSubstituteCmd = &cobra.Command{
+	Use: "substitute <input file/dir> <output dir>",
+	// TODO: add path to docs or remove
+	Short: "Substitutes secrets in input file(s), must be formated acording to used parse, see <INSERT DOCS OR WHATEVER>",
+	Long:  `Parses through the input file/dir looking for matching patterns to replace them with their respective secret. Will overwrite files at destination.`,
+	Example: `Fill a .env file to fill it with secrets.
+$ cat ./.env
+DB_URL=${MASTER_DB}
+$ doppler secrets substitute ./.env ./secrets
+$ cat ./secrets/.env
+DB_URL=postgres://john:admin@us-west-2.amazonaws.com:5432/default
+
+Target multiple files in a dir to be substituted and create output dir
+$ ls ./secrets_templates
+db_secrets.yaml
+api_secrets.yaml
+$ doppler secrets substitute ./secrets_templates ./secrets
+$ ls ./secrets
+db_secrets.yaml
+api_secrets.yaml
+
+Choose an alternate variable expression for secrets, using default output
+$ doppler secrets substitute ./.env . --var-exp=handlebars
+
+(adv.) For large files pass custom buffer size
+$ doppler secrets substitute ./large.env . --buffer-size=8000`,
+	Args: func(cmd *cobra.Command, args []string) error {
+		if len(args) != 2 {
+			utils.HandleError(fmt.Errorf("missing input and/or output args"))
+		}
+
+		inputFilePath, err := utils.GetFilePath(args[0])
+		if err != nil {
+			utils.HandleError(err)
+		} else if _, err := os.Stat(inputFilePath); os.IsPermission(err) {
+			utils.HandleError(fmt.Errorf("permission error on input dir: %s", inputFilePath))
+		} else if err != nil {
+			utils.HandleError(fmt.Errorf("unable to access: %s", inputFilePath))
+		} else {
+			args[0] = inputFilePath
+		}
+
+		outputFilePath, err := utils.GetFilePath(args[1])
+		if err != nil {
+			utils.HandleError(err)
+		}
+		if _, er := os.Stat(outputFilePath); os.IsPermission(er) {
+			utils.HandleError(fmt.Errorf("permission error on output dir: %s", outputFilePath))
+		} else if er != nil && !os.IsNotExist(er) {
+			utils.HandleError(fmt.Errorf("unable to access: %s", outputFilePath))
+		} else {
+			args[1] = outputFilePath
+		}
+
+		varExp := cmd.Flag("var-exp").Value.String()
+		substituteText := models.VarExpressions[varExp]
+		if substituteText == nil {
+			utils.HandleError(fmt.Errorf("invalid var-exp: %s", varExp))
+		}
+
+		return nil
+	},
+	PreRun: requiresToken,
+	Run:    substituteSecrets,
+}
+
+func requiresToken(cmd *cobra.Command, args []string) {
+	localConfig := configuration.LocalConfig(cmd)
+	utils.RequireValue("token", localConfig.Token.Value)
 }
 
 func secrets(cmd *cobra.Command, args []string) {
@@ -98,8 +177,6 @@ func secrets(cmd *cobra.Command, args []string) {
 	raw := utils.GetBoolFlag(cmd, "raw")
 	onlyNames := utils.GetBoolFlag(cmd, "only-names")
 	localConfig := configuration.LocalConfig(cmd)
-
-	utils.RequireValue("token", localConfig.Token.Value)
 
 	response, err := http.GetSecrets(localConfig.APIHost.Value, utils.GetBool(localConfig.VerifyTLS.Value, true), localConfig.Token.Value, localConfig.EnclaveProject.Value, localConfig.EnclaveConfig.Value)
 	if !err.IsNil() {
@@ -124,8 +201,6 @@ func getSecrets(cmd *cobra.Command, args []string) {
 	raw := utils.GetBoolFlag(cmd, "raw")
 	localConfig := configuration.LocalConfig(cmd)
 
-	utils.RequireValue("token", localConfig.Token.Value)
-
 	response, err := http.GetSecrets(localConfig.APIHost.Value, utils.GetBool(localConfig.VerifyTLS.Value, true), localConfig.Token.Value, localConfig.EnclaveProject.Value, localConfig.EnclaveConfig.Value)
 	if !err.IsNil() {
 		utils.HandleError(err.Unwrap(), err.Message)
@@ -142,8 +217,6 @@ func setSecrets(cmd *cobra.Command, args []string) {
 	jsonFlag := utils.OutputJSON
 	raw := utils.GetBoolFlag(cmd, "raw")
 	localConfig := configuration.LocalConfig(cmd)
-
-	utils.RequireValue("token", localConfig.Token.Value)
 
 	secrets := map[string]interface{}{}
 	var keys []string
@@ -173,8 +246,6 @@ func deleteSecrets(cmd *cobra.Command, args []string) {
 	yes := utils.GetBoolFlag(cmd, "yes")
 	localConfig := configuration.LocalConfig(cmd)
 
-	utils.RequireValue("token", localConfig.Token.Value)
-
 	if yes || utils.ConfirmationPrompt("Delete secret(s)", false) {
 		secrets := map[string]interface{}{}
 		for _, arg := range args {
@@ -202,8 +273,6 @@ func downloadSecrets(cmd *cobra.Command, args []string) {
 	fallbackReadonly := utils.GetBoolFlag(cmd, "fallback-readonly")
 	fallbackOnly := utils.GetBoolFlag(cmd, "fallback-only")
 	exitOnWriteFailure := !utils.GetBoolFlag(cmd, "no-exit-on-write-failure")
-
-	utils.RequireValue("token", localConfig.Token.Value)
 
 	format := cmd.Flag("format").Value.String()
 	if jsonFlag {
@@ -304,6 +373,69 @@ func downloadSecrets(cmd *cobra.Command, args []string) {
 	utils.Log(fmt.Sprintf("Downloaded secrets to %s", filePath))
 }
 
+func substituteSecrets(cmd *cobra.Command, args []string) {
+	localConfig := configuration.LocalConfig(cmd)
+	substituteText := models.VarExpressions[cmd.Flag("var-exp").Value.String()]
+	bufferSize := utils.GetIntFlag(cmd, "buffer-size", 16)
+	inputFilePath := args[0]
+	outputFilePath := args[1]
+
+	response, err := http.GetSecrets(
+		localConfig.APIHost.Value,
+		utils.GetBool(localConfig.VerifyTLS.Value, true),
+		localConfig.Token.Value, localConfig.EnclaveProject.Value,
+		localConfig.EnclaveConfig.Value)
+	if !err.IsNil() {
+		utils.HandleError(err.Unwrap(), err.Message)
+	}
+	secrets, parseErr := models.ParseSecrets(response)
+	if parseErr != nil {
+		utils.HandleError(parseErr, "Unable to parse API response")
+	}
+
+	if _, err := os.Stat(outputFilePath); os.IsNotExist(err) {
+		// TODO: hardcode perms, is this ok?
+		err := utils.MakeDir(outputFilePath, 0700)
+		if err != nil {
+			utils.HandleError(fmt.Errorf("can't create output dir: %s", outputFilePath))
+		}
+	}
+
+	var subFileList []string
+	if file, _ := os.Stat(inputFilePath); file.IsDir() {
+		fileList, err := utils.ListFiles(inputFilePath)
+		if err != nil {
+			utils.HandleError(err)
+		}
+		subFileList = fileList
+	} else {
+		subFileList = append(subFileList, inputFilePath)
+	}
+
+	fmt.Println("Substituting Files...")
+	var waitGroup sync.WaitGroup
+	for _, subFilepath := range subFileList {
+		waitGroup.Add(1)
+
+		go func(wg *sync.WaitGroup, subFp string) {
+			defer wg.Done()
+
+			textProcessor := func(text []byte) []byte {
+				return substituteText(text, secrets)
+			}
+
+			if err := utils.ProcessFile(subFp, outputFilePath, textProcessor, bufferSize); err != nil {
+				utils.HandleError(err)
+			}
+
+			fmt.Printf("\"%s\" substituted.\n", subFp)
+		}(&waitGroup, subFilepath)
+	}
+
+	waitGroup.Wait()
+	fmt.Printf("Done!")
+}
+
 func init() {
 	secretsCmd.Flags().StringP("project", "p", "", "project (e.g. backend)")
 	secretsCmd.Flags().StringP("config", "c", "", "config (e.g. dev)")
@@ -342,6 +474,11 @@ func init() {
 	secretsDownloadCmd.Flags().Bool("fallback-only", false, "read all secrets directly from the fallback file, without contacting Doppler. secrets will not be updated. (implies --fallback-readonly)")
 	secretsDownloadCmd.Flags().Bool("no-exit-on-write-failure", false, "do not exit if unable to write the fallback file")
 	secretsCmd.AddCommand(secretsDownloadCmd)
+
+	// TODO: is var-exp ok as a flag name?
+	secretsSubstituteCmd.Flags().Int("buffer-size", 4096, "size of buffer used to copy substitute files")
+	secretsSubstituteCmd.Flags().String("var-exp", "dollar-curly", "variable expression formate used to substitute secrets [dollar,dollar-curly,handlebars,dollar-handlebars]")
+	secretsCmd.AddCommand(secretsSubstituteCmd)
 
 	rootCmd.AddCommand(secretsCmd)
 }
