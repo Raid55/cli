@@ -16,7 +16,6 @@ limitations under the License.
 package cmd
 
 import (
-	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -105,13 +104,13 @@ $ doppler secrets download --format=env --no-file`,
 var secretsSubstituteCmd = &cobra.Command{
 	Use: "substitute <input file/dir> <output dir>",
 	// TODO: add path to docs or remove
-	Short: "Substitutes secrets in files, must be formated acording to used parse, see <INSERT DOCS OR WHATEVER>",
-	Long:  `Parses through the input file/dir looking for matching patterns to replace them with their respective secret`,
+	Short: "Substitutes secrets in input file(s), must be formated acording to used parse, see <INSERT DOCS OR WHATEVER>",
+	Long:  `Parses through the input file/dir looking for matching patterns to replace them with their respective secret. Will overwrite files at destination.`,
 	Example: `Fill a .env file to fill it with secrets.
-$ cat ./.env.template
-DB_URL=${MASTER_DB}
-$ doppler secrets substitute ./.env.template .
 $ cat ./.env
+DB_URL=${MASTER_DB}
+$ doppler secrets substitute ./.env ./secrets
+$ cat ./secrets/.env
 DB_URL=postgres://john:admin@us-west-2.amazonaws.com:5432/default
 
 Target multiple files in a dir to be substituted and create output dir
@@ -124,8 +123,10 @@ db_secrets.yaml
 api_secrets.yaml
 
 Choose an alternate variable expression for secrets, using default output
-$ doppler secrets substitute ./.env.template . --var-exp=handlebars`,
-	// TODO: add dev logs for errors
+$ doppler secrets substitute ./.env . --var-exp=handlebars
+
+(adv.) For large files pass custom buffer size
+$ doppler secrets substitute ./large.env . --buffer-size=8000`,
 	Args: func(cmd *cobra.Command, args []string) error {
 		if len(args) != 2 {
 			utils.HandleError(fmt.Errorf("missing input and/or output args"))
@@ -152,6 +153,12 @@ $ doppler secrets substitute ./.env.template . --var-exp=handlebars`,
 			utils.HandleError(fmt.Errorf("unable to access: %s", outputFilePath))
 		} else {
 			args[1] = outputFilePath
+		}
+
+		varExp := cmd.Flag("var-exp").Value.String()
+		substituteText := models.VarExpressions[varExp]
+		if substituteText == nil {
+			utils.HandleError(fmt.Errorf("invalid var-exp: %s", varExp))
 		}
 
 		return nil
@@ -366,15 +373,18 @@ func downloadSecrets(cmd *cobra.Command, args []string) {
 	utils.Log(fmt.Sprintf("Downloaded secrets to %s", filePath))
 }
 
-// TODO: unittests
 func substituteSecrets(cmd *cobra.Command, args []string) {
 	localConfig := configuration.LocalConfig(cmd)
-	varExp := cmd.Flag("var-exp").Value.String()
+	substituteText := models.VarExpressions[cmd.Flag("var-exp").Value.String()]
 	bufferSize := utils.GetIntFlag(cmd, "buffer-size", 16)
 	inputFilePath := args[0]
 	outputFilePath := args[1]
 
-	response, err := http.GetSecrets(localConfig.APIHost.Value, utils.GetBool(localConfig.VerifyTLS.Value, true), localConfig.Token.Value, localConfig.EnclaveProject.Value, localConfig.EnclaveConfig.Value)
+	response, err := http.GetSecrets(
+		localConfig.APIHost.Value,
+		utils.GetBool(localConfig.VerifyTLS.Value, true),
+		localConfig.Token.Value, localConfig.EnclaveProject.Value,
+		localConfig.EnclaveConfig.Value)
 	if !err.IsNil() {
 		utils.HandleError(err.Unwrap(), err.Message)
 	}
@@ -383,15 +393,9 @@ func substituteSecrets(cmd *cobra.Command, args []string) {
 		utils.HandleError(parseErr, "Unable to parse API response")
 	}
 
-	substituteText := models.VarExpressions[varExp]
-	if substituteText == nil {
-		utils.HandleError(fmt.Errorf("invalid var-exp: %s", varExp))
-	}
-
 	if _, err := os.Stat(outputFilePath); os.IsNotExist(err) {
-		fmt.Println("I want you to notice")
-		// TODO: remove hardcode perms, better safe perms
-		err := utils.MakeDir(outputFilePath, 0755)
+		// TODO: hardcode perms, is this ok?
+		err := utils.MakeDir(outputFilePath, 0700)
 		if err != nil {
 			utils.HandleError(fmt.Errorf("can't create output dir: %s", outputFilePath))
 		}
@@ -399,72 +403,37 @@ func substituteSecrets(cmd *cobra.Command, args []string) {
 
 	var subFileList []string
 	if file, _ := os.Stat(inputFilePath); file.IsDir() {
-		files, err := utils.ListDir(inputFilePath)
+		fileList, err := utils.ListFiles(inputFilePath)
 		if err != nil {
-			utils.HandleError(fmt.Errorf("can't read input path: %s", inputFilePath))
+			utils.HandleError(err)
 		}
-
-		for _, f := range files {
-			filePath := filepath.Join(inputFilePath, f.Name())
-			if f, err := os.Stat(filePath); err != nil {
-				utils.HandleError(fmt.Errorf("permission error for file: %s", filePath))
-			} else if !f.IsDir() {
-				subFileList = append(subFileList, filePath)
-			}
-		}
+		subFileList = fileList
 	} else {
 		subFileList = append(subFileList, inputFilePath)
 	}
 
+	fmt.Println("Substituting Files...")
 	var waitGroup sync.WaitGroup
 	for _, subFilepath := range subFileList {
 		waitGroup.Add(1)
 
-		// TODO: refactor, codesplit io funcs
-		// TODO: better errors, more though out flow
 		go func(wg *sync.WaitGroup, subFp string) {
 			defer wg.Done()
 
-			inFile, err := os.Open(subFp)
-			if err != nil {
+			textProcessor := func(text []byte) []byte {
+				return substituteText(text, secrets)
+			}
+
+			if err := utils.ProcessFile(subFp, outputFilePath, textProcessor, bufferSize); err != nil {
 				utils.HandleError(err)
 			}
-			defer inFile.Close()
 
-			outFilename := filepath.Join(outputFilePath, filepath.Base(inFile.Name()))
-			tempOutFilename := fmt.Sprintf("%s.%s", outFilename, utils.RandomBase64String(8))
-			defer os.Rename(tempOutFilename, outFilename)
-
-			outFile, err := os.OpenFile(tempOutFilename, os.O_CREATE|os.O_WRONLY, utils.RestrictedFilePerms())
-			if err != nil {
-				utils.HandleError(err)
-			}
-			defer outFile.Close()
-
-			reader := bufio.NewReader(inFile)
-			writer := bufio.NewWriterSize(
-				outFile,
-				bufferSize,
-			)
-			defer writer.Flush()
-
-			for {
-				token, err := utils.ReadSliceFromReader(reader)
-
-				if err := utils.WriteToBuffer(writer, substituteText(token, secrets)); err != nil {
-					utils.HandleError(err)
-				}
-
-				if err != nil {
-					break
-				}
-			}
+			fmt.Printf("\"%s\" substituted.\n", subFp)
 		}(&waitGroup, subFilepath)
 	}
 
-	fmt.Println("Substituting Files...")
 	waitGroup.Wait()
-	fmt.Printf("Substituted %s to %s", inputFilePath, outputFilePath)
+	fmt.Printf("Done!")
 }
 
 func init() {

@@ -23,17 +23,17 @@ import (
 
 // VarExpressions comment
 var VarExpressions = map[string]SubstituteText{
-	"dollar":            subFactory(`\$%s\b`),
-	"dollar-curly":      subFactory(`\$\{%s\}`),
-	"handlebars":        subFactory(`\{\{%s\}\}`),
-	"dollar-handlebars": subFactory(`\$\{\{%s\}\}`),
+	"dollar":            subTxtFactory(`\$%s\b`),
+	"dollar-curly":      subTxtFactory(`\$\{%s\}`),
+	"handlebars":        subTxtFactory(`\{\{%s\}\}`),
+	"dollar-handlebars": subTxtFactory(`\$\{\{%s\}\}`),
 }
 
 // SubstituteText somrething
-type SubstituteText func(text []byte, subs map[string]ComputedSecret) []byte
+type SubstituteText func([]byte, map[string]ComputedSecret) []byte
 
 // subFactory something
-func subFactory(expression string) SubstituteText {
+func subTxtFactory(expression string) SubstituteText {
 	var secretKeyGroup string = "([A-Z_][A-Z0-9_]*)"
 	return func(text []byte, subs map[string]ComputedSecret) []byte {
 		exp := regexp.MustCompile(fmt.Sprintf(expression, secretKeyGroup))

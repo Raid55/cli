@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path/filepath"
 )
 
 // RestrictedFilePerms perms used for creating restrictied files meant to be accessible only to the user
@@ -83,21 +84,66 @@ func WriteTempFile(name string, data []byte, perm os.FileMode) (string, error) {
 	return tmpFileName, nil
 }
 
-// ListDir docs
-func ListDir(path string) ([]os.FileInfo, error) {
-	return ioutil.ReadDir(path)
+// ListFiles list accessible files in dir, err if one file is not accessible.
+func ListFiles(path string) ([]string, error) {
+	var fileList []string
+	files, err := ioutil.ReadDir(path)
+	if err != nil {
+		return fileList, err
+	}
+
+	for _, f := range files {
+		filePath := filepath.Join(path, f.Name())
+		if f, err := os.Stat(filePath); err != nil {
+			return fileList, fmt.Errorf("permission error for file: %s", filePath)
+		} else if !f.IsDir() {
+			fileList = append(fileList, filePath)
+		}
+	}
+
+	return fileList, nil
 }
 
-// WriteToBuffer docs
-func WriteToBuffer(buf *bufio.Writer, data []byte) error { // Write bytes to buffer
-	_, err := buf.Write(data)
+// TextProcessor takes bytes, processes them, returns bytes
+type TextProcessor func([]byte) []byte
+
+// ProcessFile will read a file efficiently, run a TextProcessor func over each, and write the output to a tmp file.
+// tmp file will be renamed to original file once done if outputPath is identical to loc. of inputFile.
+func ProcessFile(inputFile string, outputPath string, txtProcessorFn TextProcessor, buffSize int) error {
+	inFile, err := os.Open(inputFile)
 	if err != nil {
 		return err
 	}
-	return nil
-}
+	defer inFile.Close()
 
-// ReadSliceFromReader read slice from buf reader
-func ReadSliceFromReader(reader *bufio.Reader) ([]byte, error) {
-	return reader.ReadSlice('\n')
+	outFilepath := filepath.Join(outputPath, filepath.Base(inFile.Name()))
+	tmpOutFilepath := fmt.Sprintf("%s.%s", outFilepath, RandomBase64String(8))
+	outFile, err := os.OpenFile(tmpOutFilepath, os.O_CREATE|os.O_WRONLY, RestrictedFilePerms())
+	if err != nil {
+		return err
+	}
+	defer os.Rename(tmpOutFilepath, outFilepath)
+	defer outFile.Close()
+
+	reader := bufio.NewReader(inFile)
+	writer := bufio.NewWriterSize(
+		outFile,
+		buffSize,
+	)
+
+	for {
+		slice, err := reader.ReadSlice('\n')
+
+		data := txtProcessorFn(slice)
+		if _, err := writer.Write(data); err != nil {
+			return err
+		}
+
+		if err != nil {
+			break
+		}
+	}
+	defer writer.Flush()
+
+	return nil
 }
